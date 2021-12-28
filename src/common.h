@@ -24,4 +24,9 @@ static inline void println_bin_32(uint32_t w) {
   );
 }
 
+static double clamp(double d, double min, double max) {
+  const double t = d < min ? min : d;
+  return t > max ? max : t;
+}
+
 #endif

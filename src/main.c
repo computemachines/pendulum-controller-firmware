@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <math.h>
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "hardware/gpio.h"
@@ -14,6 +15,10 @@ void on_gpio_isr(uint gpio, uint32_t events);
 #define REVERSE_PULSE_PIN 19 // should be PWM_CHANNEL_1B
 #define QUADRATURE_ERROR_PIN 16
 #define PULSES_PER_REV 2400
+#define FORWARD_MOTOR_PIN 20
+#define REVERSE_MOTOR_PIN 21
+#define MOTOR_ENABLE_PIN 14
+#define PWM_WRAP_NUMBER 0xFFF
 
 /* Set up pwm block as counter on gpio pin .
  * Returns pwm slice number.
@@ -82,45 +87,11 @@ float get_angle_deg()
     return (get_position() % PULSES_PER_REV) * 360.0 / PULSES_PER_REV;
 }
 
-static float angular_velocity = 0;
-int64_t alarm_callback(alarm_id_t id, void *user_data)
-{
-    printf("Timer %d fired\n", (int)id);
-    return 0;
-}
-
-static float _last_position;
-static absolute_time_t _last_time_measured;
-static float _last_angular_velocity;
-static struct repeating_timer _angular_velocity_timer;
-bool repeat_timer_compute_angular_velocity_callback(struct repeating_timer *t);
-
-void start_angular_velocity_thread()
-{
-    _last_position = get_raw_angle_deg();
-    _last_time_measured = get_absolute_time();
-    add_repeating_timer_ms(-1, repeat_timer_compute_angular_velocity_callback, NULL, &_angular_velocity_timer);
-}
-bool stop_angular_velocity_thread()
-{
-    return cancel_repeating_timer(&_angular_velocity_timer);
-}
-
-bool repeat_timer_compute_angular_velocity_callback(struct repeating_timer *t)
-{
-    float current_position = get_raw_angle_deg();
-
-    float delta_position = current_position - _last_position;
-    _last_angular_velocity = delta_position * 1000000 / t->delay_us;
-
-    _last_position = current_position;
-    return true;
-}
-
-float get_angular_velocity()
-{
-    return _last_angular_velocity;
-}
+float control_loop(uint32_t time);
+void set_motor_enabled(bool enabled);
+void set_motor_duty_cycle(float ratio);
+void set_motor_direction(bool forward);
+void set_motor_brake(bool brake);
 
 int main()
 {
@@ -145,19 +116,90 @@ int main()
     gpio_set_dir(QUADRATURE_ERROR_PIN, false);
     gpio_set_irq_enabled_with_callback(QUADRATURE_ERROR_PIN, GPIO_IRQ_EDGE_RISE, true, &on_gpio_isr);
 
-    // ---- set up timers
-    start_angular_velocity_thread();
+    // ---- init pwm ----
+    gpio_set_function(MOTOR_ENABLE_PIN, GPIO_FUNC_PWM);
+    gpio_init(FORWARD_MOTOR_PIN);
+    gpio_init(REVERSE_MOTOR_PIN);
+    gpio_set_dir(FORWARD_MOTOR_PIN, true);
+    gpio_set_dir(REVERSE_MOTOR_PIN, true);
+
+    uint slice = pwm_gpio_to_slice_num(MOTOR_ENABLE_PIN);
+    pwm_set_wrap(slice, PWM_WRAP_NUMBER);
+    set_motor_enabled(true);
 
     while (to_ms_since_boot(get_absolute_time()) <= 60 * 1000)
     {
         sleep_ms(50);
         absolute_time_t time = get_absolute_time();
         uint32_t elapsed = (uint32_t)to_us_since_boot(time);
-        printf("Angle: %0.1f,\t Angular Velocity: %f\n", get_angle_deg(), get_angular_velocity());
+
+        float velocity = control_loop(elapsed);
+
+        // printf("Angle: %0.1f,\t Angular Velocity: %f\n", get_angle_deg(), velocity);
     }
     sleep_ms(2000);
-    stop_angular_velocity_thread();
+
+    set_motor_enabled(false);
 
     printf("---- DONE ----\n");
     return 0;
+}
+
+void set_motor_duty_cycle(float ratio) {
+    uint slice = pwm_gpio_to_slice_num(MOTOR_ENABLE_PIN);
+
+    pwm_set_chan_level(slice, PWM_CHAN_A, clamp(ratio, 0, 1) * PWM_WRAP_NUMBER);
+}
+
+void set_motor_direction(bool forward) {
+    if (forward) {
+        gpio_put(FORWARD_MOTOR_PIN, true);
+        gpio_put(REVERSE_MOTOR_PIN, false);
+    } else {
+        gpio_put(FORWARD_MOTOR_PIN, false);
+        gpio_put(REVERSE_MOTOR_PIN, true);
+    }
+}
+
+void set_motor_enabled(bool enabled){
+    if (enabled) {
+        uint slice = pwm_gpio_to_slice_num(MOTOR_ENABLE_PIN);
+        pwm_set_enabled(slice, enabled);
+    } else {
+        set_motor_duty_cycle(0.f);
+    }
+}
+
+void set_motor_brake(bool brake) {
+    if(brake){
+        set_motor_duty_cycle(1.f);
+        // gpio_put(MOTOR_ENABLE_PIN, true);
+        gpio_put(FORWARD_MOTOR_PIN, false);
+        gpio_put(REVERSE_MOTOR_PIN, false);
+    } else {
+        set_motor_duty_cycle(0.f);
+        // gpio_put(MOTOR_ENABLE_PIN, false);
+    }
+}
+
+static float last_raw_angle = 0;
+static uint32_t last_time_us;
+float control_loop(uint32_t time_us)
+{
+    // get current configuration
+    float current_raw_angle = get_raw_angle_deg();
+
+    // compute current state
+    uint32_t time_step_us = time_us - last_time_us;
+    float angular_velocity = 1000000 * (current_raw_angle - last_raw_angle) / last_time_us;
+
+    
+    set_motor_direction(angular_velocity > -(get_raw_angle_deg() - 180)/sqrt(9.8));
+    set_motor_duty_cycle(1.0);
+
+    // finish up
+    last_time_us = time_us;
+    last_raw_angle = current_raw_angle;
+
+    return angular_velocity;
 }
